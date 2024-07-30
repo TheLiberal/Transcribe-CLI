@@ -4,6 +4,8 @@ use std::fs;
 use tempfile::{TempDir, NamedTempFile};
 use std::path::PathBuf;
 use dotenv::dotenv;
+use ffmpeg_next as ffmpeg;
+use std::f32::consts::PI;
 
 struct TestEnv {
     _temp_dir: TempDir,
@@ -24,6 +26,67 @@ fn setup_test_env() -> TestEnv {
         _temp_dir: temp_dir,
         config_path,
     }
+}
+
+fn init_ffmpeg() {
+    ffmpeg::init().unwrap();
+}
+
+fn create_test_m4a_file(path: &str, duration_seconds: f32) -> Result<(), Box<dyn std::error::Error>> {
+    init_ffmpeg();
+
+    let mut oc = ffmpeg::format::output(&path)?;
+    let mut stream = oc.add_stream(ffmpeg::encoder::find(ffmpeg::codec::Id::AAC))?;
+    let context = stream.codec().encoder().audio()?;
+    let mut encoder = context.open_as(ffmpeg::encoder::audio::AudioEncoder)?;
+
+    encoder.set_rate(44100);
+    encoder.set_channels(1);
+    encoder.set_format(ffmpeg::util::sample::Sample::F32(ffmpeg::util::sample::Type::Packed));
+    encoder.set_bit_rate(128_000);
+
+    let time_base = ffmpeg::Rational(1, 44100);
+    encoder.set_time_base(time_base);
+    stream.set_time_base(time_base);
+
+    oc.write_header()?;
+
+    let mut samples = Vec::new();
+    let total_samples = (44100.0 * duration_seconds) as usize;
+
+    for i in 0..total_samples {
+        let t = i as f32 / 44100.0;
+        let sample = (t * 440.0 * 2.0 * PI).sin();
+        samples.push(sample);
+    }
+
+    let mut frame = ffmpeg::frame::Audio::new(ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed), 1024, 1);
+    let mut packet = ffmpeg::Packet::empty();
+
+    for chunk in samples.chunks(1024) {
+        frame.plane_mut(0).copy_from_slice(chunk);
+        frame.set_pts(Some(stream.pts()));
+
+        encoder.send_frame(&frame)?;
+        while encoder.receive_packet(&mut packet).is_ok() {
+            packet.set_stream(0);
+            packet.rescale_ts(time_base, stream.time_base());
+            packet.write_interleaved(&mut oc)?;
+        }
+
+        stream.set_pts(stream.pts() + 1024);
+    }
+
+    encoder.send_eof()?;
+    while encoder.receive_packet(&mut packet).is_ok() {
+        packet.set_stream(0);
+        packet.rescale_ts(time_base, stream.time_base());
+        packet.write_interleaved(&mut oc)?;
+    }
+
+    oc.write_trailer()?;
+
+    Ok(())
 }
 
 #[test]
@@ -78,8 +141,8 @@ fn test_valid_file() {
     let temp_file = NamedTempFile::new().unwrap();
     let file_path = temp_file.path().to_str().unwrap();
 
-    // Write some valid audio data to the file
-    std::fs::write(file_path, include_bytes!("C:/Users/Blaise/Downloads/firewater_mark_evan.m4a")).unwrap();
+    // Create a small valid audio file (1 second)
+    create_test_m4a_file(file_path, 1.0).unwrap();
 
     let mut cmd = Command::cargo_bin("transcribe").unwrap();
     cmd.env("TRANSCRIBE_CONFIG_DIR", test_env.config_path.to_str().unwrap())
@@ -146,9 +209,8 @@ fn test_large_file_upload() {
     let large_file = NamedTempFile::new().unwrap();
     let file_path = large_file.path().to_str().unwrap();
     
-    // Create a large file with valid audio data
-    let large_data = include_bytes!("C:/Users/Blaise/Downloads/firewater_mark_evan.m4a");
-    fs::write(file_path, large_data).unwrap();
+   // Create a larger valid audio file (10 seconds)
+    create_test_m4a_file(file_path, 10.0).unwrap();
 
     let mut cmd = Command::cargo_bin("transcribe").unwrap();
     cmd.env("TRANSCRIBE_CONFIG_DIR", test_env.config_path.to_str().unwrap())
