@@ -61,27 +61,30 @@ async fn send_request(
         let file_size = file.metadata().await?.len();
         upload_pb.lock().unwrap().set_length(file_size);
         upload_pb.lock().unwrap().set_message("Uploading...");
+        transcribe_pb.lock().unwrap().set_message("Waiting for upload...");
 
         let upload_pb_clone = Arc::clone(&upload_pb);
         let stream = FramedRead::new(file, BytesCodec::new())
             .map_ok(move |chunk: BytesMut| {
-                upload_pb_clone.lock().unwrap().inc(chunk.len() as u64);
+                let len = chunk.len() as u64;
+                upload_pb_clone.lock().unwrap().inc(len);
                 chunk.freeze()
             })
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
 
         let body = reqwest::Body::wrap_stream(stream);
 
-        let response = client
+        upload_pb.lock().unwrap().set_message("Sending request...");
+        transcribe_pb.lock().unwrap().set_message("Transcribing...");
+
+        client
             .post(request_url)
             .header("Authorization", format!("Token {}", api_key))
             .header("Content-Type", "application/octet-stream")
             .body(body)
             .send()
-            .await?;
-
-        upload_pb.lock().unwrap().finish_and_clear();
-        Ok(response)
+            .await
+            .map_err(|e| format!("Error sending file to Deepgram API: {}", e).into())
     } else {
         let url = Url::parse(&args.input).map_err(|_| "Invalid URL provided")?;
         
@@ -120,6 +123,7 @@ async fn send_request_with_retry(
             Ok(response) => return Ok(response),
             Err(e) if attempt < max_retries => {
                 eprintln!("Attempt {} failed: {}. Retrying in 5 seconds...", attempt, e);
+                upload_pb.lock().unwrap().reset();
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
             Err(e) => return Err(e),
@@ -140,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transcribe_pb = Arc::new(Mutex::new(m.add(ProgressBar::new_spinner())));
 
     upload_pb.lock().unwrap().set_style(ProgressStyle::default_bar()
-        .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
+        .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta}) {msg}")
         .unwrap()
         .progress_chars("##-"));
 
@@ -149,7 +153,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .template("{spinner} {msg} {elapsed_precise}")
         .unwrap());
 
-    transcribe_pb.lock().unwrap().set_message("Preparing...");
+    if args.is_file {
+        upload_pb.lock().unwrap().set_message("Preparing...");
+        transcribe_pb.lock().unwrap().set_message("Waiting...");
+    } else {
+        transcribe_pb.lock().unwrap().set_message("Preparing...");
+    }
 
     let transcribe_pb_clone = Arc::clone(&transcribe_pb);
     let progress_handle = thread::spawn(move || {

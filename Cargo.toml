@@ -24,6 +24,7 @@ bytes = "1.0"
 assert_cmd = "2.0"
 predicates = "2.1"
 tempfile = "3.2"
+dirs = "5.0"
 
 
 [[bin]]
