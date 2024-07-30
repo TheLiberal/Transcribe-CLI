@@ -2,19 +2,25 @@
 name = "transcribe_cli"
 version = "0.1.0"
 edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Blaise Gulaj <bgulaj@gmail.com>"]
 description = "A CLI tool for transcribing audio files using Deepgram"
 license = "MIT"
-repository = "https://github.com/yourusername/transcribe_cli"
+repository = "https://github.com/TheLiberal/Transcribe-CLI/"
 
 [dependencies]
-reqwest = { version = "0.11", features = ["json"] }
-tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "stream"] }
+url = "2.3.1"
+tokio = { version = "1.0", features = ["full"] }
+tokio-util = { version = "0.7.0", features = ["codec"] }
+futures-util = "0.3.28"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 chrono = "0.4"
 dirs = "5.0"
+indicatif = "0.17.0"
+bytes = "1.0"
+
 
 [[bin]]
 name = "transcribe"
