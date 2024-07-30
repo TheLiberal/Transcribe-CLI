@@ -25,6 +25,7 @@ assert_cmd = "2.0"
 predicates = "2.1"
 tempfile = "3.2"
 dirs = "5.0"
+dotenv = "0.15.0"
 
 
 [[bin]]

@@ -2,7 +2,7 @@ use clap::Parser;
 use reqwest::Client;
 use serde_json::json;
 use std::fs::File;
-use std::io::{Write, stdin};
+use std::io::Write;
 use std::path::PathBuf;
 use chrono::Utc;
 use dirs::home_dir;
@@ -27,7 +27,16 @@ struct Args {
 }
 
 fn get_config_dir() -> PathBuf {
-    home_dir().unwrap().join(".transcribe_cli")
+    std::env::var("TRANSCRIBE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home_dir().unwrap().join(".transcribe_cli"))
+}
+
+// Add this function to get the output directory
+fn get_output_dir() -> PathBuf {
+    std::env::var("TRANSCRIBE_OUTPUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dirs::desktop_dir().expect("Could not find desktop directory"))
 }
 
 fn get_api_key() -> Result<String, Box<dyn std::error::Error>> {
@@ -35,14 +44,18 @@ fn get_api_key() -> Result<String, Box<dyn std::error::Error>> {
     let key_file = config_dir.join("api_key");
 
     if key_file.exists() {
-        Ok(std::fs::read_to_string(key_file)?.trim().to_string())
+        let key = std::fs::read_to_string(&key_file)?.trim().to_string();
+        if key.is_empty() {
+            return Err("API key file is empty".into());
+        }
+        Ok(key)
     } else {
         println!("Deepgram API key not found. Please enter it:");
         let mut key = String::new();
-        stdin().read_line(&mut key)?;
+        std::io::stdin().read_line(&mut key)?;
         let key = key.trim().to_string();
         std::fs::create_dir_all(&config_dir)?;
-        std::fs::write(key_file, &key)?;
+        std::fs::write(&key_file, &key)?;
         println!("API key saved.");
         Ok(key)
     }
@@ -120,7 +133,18 @@ async fn send_request_with_retry(
     let max_retries = 3;
     for attempt in 1..=max_retries {
         match send_request(client, request_url, api_key, args, upload_pb, transcribe_pb).await {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                if response.status() == 401 {
+                    return Err("Invalid API key".into());
+                }
+                if response.status().is_client_error() || response.status().is_server_error() {
+                    let error_message = format!("API request failed with status: {}", response.status());
+                    eprintln!("{}", error_message);
+                    eprintln!("Response body: {}", response.text().await?);
+                    return Err(error_message.into());
+                }
+                return Ok(response);
+            },
             Err(e) if attempt < max_retries => {
                 eprintln!("Attempt {} failed: {}. Retrying in 5 seconds...", attempt, e);
                 upload_pb.lock().unwrap().reset();
@@ -178,9 +202,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => {
             upload_pb.lock().unwrap().finish_and_clear();
             transcribe_pb.lock().unwrap().finish_and_clear();
-            eprintln!("Error: Failed to send request to Deepgram API");
-            eprintln!("Details: {}", e);
-            return Err("Failed to connect to Deepgram API".into());
+            eprintln!("Error: {}", e);
+        if e.to_string() == "Invalid API key" {
+            eprintln!("Please check your API key and try again.");
+        }
+        return Err(e);
         }
     };
 
@@ -222,10 +248,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         now.format("%H-%M-%S")
     );
 
-    let desktop = dirs::desktop_dir().expect("Could not find desktop directory");
-    let output_path = desktop.join(filename);
-    let mut file = File::create(output_path)?;
-    file.write_all(transcript.as_bytes())?;
+    // let desktop = dirs::desktop_dir().expect("Could not find desktop directory");
+    // let output_path = desktop.join(filename);
+    // let mut file = File::create(output_path)?;
+    // file.write_all(transcript.as_bytes())?;
+
+    let output_dir = get_output_dir();
+let output_path = output_dir.join(filename);
+let mut file = File::create(output_path)?;
+file.write_all(transcript.as_bytes())?;
 
     println!("Transcription successful. File saved on Desktop.");
     println!("Total time: {:.2?}", elapsed);
