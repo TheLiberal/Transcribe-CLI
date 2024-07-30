@@ -1,7 +1,7 @@
 use clap::Parser;
 use reqwest::Client;
 use serde_json::json;
-use std::fs::{File, create_dir_all};
+use std::fs::File;
 use std::io::{Write, stdin};
 use std::path::PathBuf;
 use chrono::Utc;
@@ -13,6 +13,8 @@ use tokio_util::codec::{BytesCodec, FramedRead};
 use futures_util::TryStreamExt;
 use bytes::BytesMut;
 use std::sync::{Arc, Mutex};
+use tokio::time::{Instant, Duration};
+use std::thread;
 
 
 #[derive(Parser, Debug)]
@@ -39,39 +41,22 @@ fn get_api_key() -> Result<String, Box<dyn std::error::Error>> {
         let mut key = String::new();
         stdin().read_line(&mut key)?;
         let key = key.trim().to_string();
-        create_dir_all(&config_dir)?;
+        std::fs::create_dir_all(&config_dir)?;
         std::fs::write(key_file, &key)?;
         println!("API key saved.");
         Ok(key)
     }
 }
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-    let api_key = get_api_key()?;
 
-    println!("Starting transcription process...");
-
-    let m = MultiProgress::new();
-    let upload_pb = Arc::new(Mutex::new(m.add(ProgressBar::new(0))));
-    let transcribe_pb = m.add(ProgressBar::new_spinner());
-
-    upload_pb.lock().unwrap().set_style(ProgressStyle::default_bar()
-        .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
-        .unwrap()
-        .progress_chars("##-"));
-
-    transcribe_pb.set_style(ProgressStyle::default_spinner()
-        .tick_chars("-\\|/")
-        .template("{spinner} Transcribing... {elapsed_precise}")
-        .unwrap());
-
-    transcribe_pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
-    let client = Client::new();
-    let request_url = "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&paragraphs=true&diarize=true";
-
-    let response = if args.is_file {
+async fn send_request(
+    client: &Client,
+    request_url: &str,
+    api_key: &str,
+    args: &Args,
+    upload_pb: &Arc<Mutex<ProgressBar>>,
+    transcribe_pb: &Arc<Mutex<ProgressBar>>,
+) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
+    if args.is_file {
         let file = TokioFile::open(&args.input).await?;
         let file_size = file.metadata().await?.len();
         upload_pb.lock().unwrap().set_length(file_size);
@@ -95,33 +80,132 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .send()
             .await?;
 
-        upload_pb.lock().unwrap().finish_with_message("Upload complete");
-        response
+        upload_pb.lock().unwrap().finish_and_clear();
+        Ok(response)
     } else {
         let url = Url::parse(&args.input).map_err(|_| "Invalid URL provided")?;
+        
+        transcribe_pb.lock().unwrap().set_message("Transcribing...");
+        
         client
             .post(request_url)
             .header("Authorization", format!("Token {}", api_key))
             .json(&json!({ "url": url.as_str() }))
             .send()
-            .await?
+            .await
+            .map_err(|e| {
+                if e.is_connect() {
+                    "Failed to connect to Deepgram API. Please check your internet connection.".into()
+                } else if e.is_timeout() {
+                    "Request to Deepgram API timed out. Please try again later.".into()
+                } else {
+                    format!("Error sending request to Deepgram API: {}", e).into()
+                }
+            })
+    }
+}
+
+
+async fn send_request_with_retry(
+    client: &Client,
+    request_url: &str,
+    api_key: &str,
+    args: &Args,
+    upload_pb: &Arc<Mutex<ProgressBar>>,
+    transcribe_pb: &Arc<Mutex<ProgressBar>>,
+) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
+    let max_retries = 3;
+    for attempt in 1..=max_retries {
+        match send_request(client, request_url, api_key, args, upload_pb, transcribe_pb).await {
+            Ok(response) => return Ok(response),
+            Err(e) if attempt < max_retries => {
+                eprintln!("Attempt {} failed: {}. Retrying in 5 seconds...", attempt, e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err("Max retries reached. Unable to connect to Deepgram API.".into())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    let api_key = get_api_key()?;
+
+    println!("Starting transcription process...");
+
+    let m = MultiProgress::new();
+    let upload_pb = Arc::new(Mutex::new(m.add(ProgressBar::new(0))));
+    let transcribe_pb = Arc::new(Mutex::new(m.add(ProgressBar::new_spinner())));
+
+    upload_pb.lock().unwrap().set_style(ProgressStyle::default_bar()
+        .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
+        .unwrap()
+        .progress_chars("##-"));
+
+    transcribe_pb.lock().unwrap().set_style(ProgressStyle::default_spinner()
+        .tick_chars("-\\|/")
+        .template("{spinner} {msg} {elapsed_precise}")
+        .unwrap());
+
+    transcribe_pb.lock().unwrap().set_message("Preparing...");
+
+    let transcribe_pb_clone = Arc::clone(&transcribe_pb);
+    let progress_handle = thread::spawn(move || {
+        loop {
+            transcribe_pb_clone.lock().unwrap().tick();
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    let client = Client::new();
+    let request_url = "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&paragraphs=true&diarize=true";
+
+    let start_time = Instant::now();
+
+    let response = match send_request_with_retry(&client, request_url, &api_key, &args, &upload_pb, &transcribe_pb).await {
+        Ok(response) => response,
+        Err(e) => {
+            upload_pb.lock().unwrap().finish_and_clear();
+            transcribe_pb.lock().unwrap().finish_and_clear();
+            eprintln!("Error: Failed to send request to Deepgram API");
+            eprintln!("Details: {}", e);
+            return Err("Failed to connect to Deepgram API".into());
+        }
     };
 
     if !response.status().is_success() {
-        upload_pb.lock().unwrap().finish_with_message("Upload failed");
-        transcribe_pb.finish_with_message("Transcription failed");
-        println!("API request failed with status: {}", response.status());
-        println!("Response body: {}", response.text().await?);
+        upload_pb.lock().unwrap().finish_and_clear();
+        transcribe_pb.lock().unwrap().finish_and_clear();
+        eprintln!("API request failed with status: {}", response.status());
+        eprintln!("Response body: {}", response.text().await?);
         return Err("API request failed".into());
     }
 
-let result: serde_json::Value = response.json().await?;
+    let result: serde_json::Value = match response.json().await {
+        Ok(json) => json,
+        Err(e) => {
+            transcribe_pb.lock().unwrap().finish_and_clear();
+            eprintln!("Failed to parse API response: {}", e);
+            return Err("Failed to parse API response".into());
+        }
+    };
 
-let transcript = result["results"]["channels"][0]["alternatives"][0]["transcript"]
-    .as_str()
-    .unwrap_or("Transcription failed");
+    let transcript = match result["results"]["channels"][0]["alternatives"][0]["transcript"].as_str() {
+        Some(text) => text,
+        None => {
+            transcribe_pb.lock().unwrap().finish_and_clear();
+            eprintln!("Failed to extract transcript from API response");
+            return Err("Failed to extract transcript".into());
+        }
+    };
 
-transcribe_pb.finish_with_message("Transcription completed");
+    let elapsed = start_time.elapsed();
+    transcribe_pb.lock().unwrap().finish_and_clear();
+
+    // Stop the progress bar thread
+    progress_handle.thread().unpark();
 
     let now = Utc::now();
     let filename = format!("transcription-{}-{}.md", 
@@ -135,6 +219,7 @@ transcribe_pb.finish_with_message("Transcription completed");
     file.write_all(transcript.as_bytes())?;
 
     println!("Transcription successful. File saved on Desktop.");
+    println!("Total time: {:.2?}", elapsed);
 
     Ok(())
 }
