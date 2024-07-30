@@ -1,0 +1,21 @@
+[package]
+name = "transcribe_cli"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A CLI tool for transcribing audio files using Deepgram"
+license = "MIT"
+repository = "https://github.com/yourusername/transcribe_cli"
+
+[dependencies]
+reqwest = { version = "0.11", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+chrono = "0.4"
+dirs = "5.0"
+
+[[bin]]
+name = "transcribe"
+path = "src/main.rs"
