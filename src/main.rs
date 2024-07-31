@@ -76,7 +76,7 @@ async fn send_request(
         upload_pb.lock().unwrap().set_message("Uploading...");
         transcribe_pb.lock().unwrap().set_message("Waiting for upload...");
 
-        let upload_pb_clone = Arc::clone(&upload_pb);
+        let upload_pb_clone = Arc::clone(upload_pb);
         let stream = FramedRead::new(file, BytesCodec::new())
             .map_ok(move |chunk: BytesMut| {
                 let len = chunk.len() as u64;
